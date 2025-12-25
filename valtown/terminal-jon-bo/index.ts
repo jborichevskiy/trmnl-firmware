@@ -93,8 +93,10 @@ const weatherCodes: { [key: number]: string } = {
 // Weather data fetching using Open-Meteo (fast, no API key)
 async function fetchWeatherData() {
   try {
+    const lat = Deno.env.get("WEATHER_LAT") || "40.02418864518805";
+    const lng = Deno.env.get("WEATHER_LNG") || "-105.28462211989343";
     const response = await fetch(
-      "https://api.open-meteo.com/v1/forecast?latitude=40.02418864518805&longitude=-105.28462211989343&current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min&temperature_unit=fahrenheit&timezone=America/Denver"
+      `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}&current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min&temperature_unit=fahrenheit&timezone=America/Denver`
     );
 
     if (!response.ok) {
