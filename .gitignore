@@ -10,3 +10,4 @@
 sdkconfig.*
 !sdkconfig.defaults
 managed_components/
+valtown/terminal-jon-bo/.vt/state.json
