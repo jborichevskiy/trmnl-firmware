@@ -30,14 +30,14 @@ app.get("/api/display", async (c) => {
     const url = new URL(c.req.url);
     const baseUrl = `${url.protocol}//${url.host}`;
 
-    // Just point to the image endpoint - it will fetch weather fresh
+    // Just point to the image endpoint - it will fetch data fresh
     const timestamp = Date.now();
-    const imageUrl = `${baseUrl}/image/weather_${timestamp}.bmp`;
+    const imageUrl = `${baseUrl}/image/display_${timestamp}.bmp`;
 
     return c.json({
       status: 0,
       image_url: imageUrl,
-      filename: `weather_${timestamp}`,  // Unique filename so device knows to refresh
+      filename: `display_${timestamp}`,  // Unique filename so device knows to refresh
       refresh_rate: 900  // 15 minutes
     });
   } catch (error) {
@@ -137,26 +137,100 @@ async function fetchWeatherData() {
   }
 }
 
-// BMP image generation (now returns Uint8Array instead of data URL)
-function generateWeatherBMP(weatherData: any): Uint8Array {
+// Bus stop IDs (will move to env vars later)
+const BUS_STOP_NORTH = "12551";
+const BUS_STOP_SOUTH = "19193";
+
+// Fetch next bus times from RTD API
+async function fetchBusData(stopId: string): Promise<{next: string | null, after: string | null}> {
+  try {
+    const response = await fetch(
+      `https://nodejs-prod.rtd-denver.com/api/v2/nextride/stops/${stopId}`
+    );
+
+    if (!response.ok) {
+      throw new Error(`RTD API error: ${response.status}`);
+    }
+
+    const data = await response.json();
+    const now = Date.now();
+
+    // Collect all departures from all branches
+    const departures: number[] = [];
+
+    if (data.branches && Array.isArray(data.branches)) {
+      for (const branch of data.branches) {
+        if (branch.upcomingTrips && Array.isArray(branch.upcomingTrips)) {
+          for (const trip of branch.upcomingTrips) {
+            // Prefer predicted time, fall back to scheduled
+            const departureTime = trip.predictedDepartureTime || trip.scheduledDepartureTime;
+            if (departureTime && departureTime > now) {
+              departures.push(departureTime);
+            }
+          }
+        }
+      }
+    }
+
+    // Sort and get next 2
+    departures.sort((a, b) => a - b);
+
+    const formatTime = (ms: number): string => {
+      return new Date(ms).toLocaleTimeString('en-US', {
+        hour: 'numeric',
+        minute: '2-digit',
+        timeZone: 'America/Denver'
+      });
+    };
+
+    return {
+      next: departures[0] ? formatTime(departures[0]) : null,
+      after: departures[1] ? formatTime(departures[1]) : null
+    };
+  } catch (error) {
+    console.error("RTD API error:", error);
+    return { next: null, after: null };
+  }
+}
+
+// BMP image generation for combined weather + bus display
+interface BusData {
+  next: string | null;
+  after: string | null;
+}
+
+interface DisplayData {
+  weather: {
+    temperature: string;
+    low: string;
+    high: string;
+    condition: string;
+    city: string;
+    time: string;
+  };
+  northBus: BusData;
+  southBus: BusData;
+}
+
+function generateCombinedBMP(data: DisplayData): Uint8Array {
   const width = 800;
   const height = 480;
   const bytesPerRow = Math.ceil(width / 8); // 1 bit per pixel, so 8 pixels per byte
   const paddedBytesPerRow = Math.ceil(bytesPerRow / 4) * 4; // BMP rows must be padded to 4-byte boundary
   const pixelDataSize = paddedBytesPerRow * height;
   const fileSize = 62 + pixelDataSize; // 62 byte header + pixel data
-  
+
   // Create BMP header (62 bytes total)
   const header = new ArrayBuffer(62);
   const headerView = new DataView(header);
-  
+
   // BMP file header (14 bytes)
   headerView.setUint8(0, 0x42); // 'B'
   headerView.setUint8(1, 0x4D); // 'M'
   headerView.setUint32(2, fileSize, true); // File size
   headerView.setUint32(6, 0, true); // Reserved
   headerView.setUint32(10, 62, true); // Offset to pixel data
-  
+
   // DIB header (48 bytes for BITMAPV3INFOHEADER)
   headerView.setUint32(14, 40, true); // DIB header size
   headerView.setInt32(18, width, true); // Width
@@ -169,27 +243,42 @@ function generateWeatherBMP(weatherData: any): Uint8Array {
   headerView.setInt32(42, 2835, true); // Y pixels per meter
   headerView.setUint32(46, 2, true); // Colors used
   headerView.setUint32(50, 0, true); // Important colors
-  
+
   // Color palette (8 bytes for 1-bit: black and white)
   headerView.setUint32(54, 0x00000000, true); // Black
   headerView.setUint32(58, 0x00FFFFFF, true); // White
-  
+
   // Create pixel data (all white background initially)
   const pixelData = new Uint8Array(pixelDataSize);
   pixelData.fill(0xFF); // All white (1 bits)
 
-  // Draw text on the image
-  drawText(pixelData, weatherData.temperature, 50, 80, width, paddedBytesPerRow, 10); // Large current temp
-  drawText(pixelData, `LOW ${weatherData.low}  HIGH ${weatherData.high}`, 50, 180, width, paddedBytesPerRow, 3); // High/Low
-  drawText(pixelData, weatherData.condition, 50, 260, width, paddedBytesPerRow, 3); // Weather condition
-  drawText(pixelData, weatherData.city, 50, 330, width, paddedBytesPerRow, 3); // City
-  drawText(pixelData, `LAST UPDATED ${weatherData.time}`, 50, 400, width, paddedBytesPerRow, 2); // Time
-  
+  // Weather section (top)
+  drawText(pixelData, data.weather.temperature, 50, 40, width, paddedBytesPerRow, 8); // Large current temp
+  drawText(pixelData, `H ${data.weather.high} L ${data.weather.low} ${data.weather.condition}`, 50, 120, width, paddedBytesPerRow, 3);
+
+  // Divider line
+  drawHorizontalLine(pixelData, 50, 160, 700, paddedBytesPerRow);
+
+  // Bus section (tighter vertical spacing within each bus group)
+  const northNext = data.northBus.next || "--:--";
+  const northAfter = data.northBus.after || "--:--";
+  const southNext = data.southBus.next || "--:--";
+  const southAfter = data.southBus.after || "--:--";
+
+  drawText(pixelData, `NORTH BUS: ${northNext}`, 50, 190, width, paddedBytesPerRow, 3);
+  drawText(pixelData, `THEN: ${northAfter}`, 50, 225, width, paddedBytesPerRow, 2);
+
+  drawText(pixelData, `SOUTH BUS: ${southNext}`, 50, 295, width, paddedBytesPerRow, 3);
+  drawText(pixelData, `THEN: ${southAfter}`, 50, 330, width, paddedBytesPerRow, 2);
+
+  // Footer
+  drawText(pixelData, `UPDATED ${data.weather.time}`, 50, 430, width, paddedBytesPerRow, 2);
+
   // Combine header and pixel data
   const bmpData = new Uint8Array(fileSize);
   bmpData.set(new Uint8Array(header), 0);
   bmpData.set(pixelData, 62);
-  
+
   // Return the raw BMP data
   return bmpData;
 }
@@ -284,16 +373,31 @@ function setPixel(pixelData: Uint8Array, x: number, y: number, paddedBytesPerRow
   }
 }
 
+// Draw a horizontal line
+function drawHorizontalLine(pixelData: Uint8Array, x: number, y: number, length: number, paddedBytesPerRow: number) {
+  for (let i = 0; i < length; i++) {
+    setPixel(pixelData, x + i, y, paddedBytesPerRow, false); // black pixel
+  }
+}
+
 // Serve BMP images dynamically
 app.get("/image/:filename", async (c) => {
   const filename = c.req.param("filename");
 
   try {
-    // Fetch live weather from Open-Meteo
-    const weatherData = await fetchWeatherData();
+    // Fetch weather and bus data in parallel
+    const [weatherData, northBus, southBus] = await Promise.all([
+      fetchWeatherData(),
+      fetchBusData(BUS_STOP_NORTH),
+      fetchBusData(BUS_STOP_SOUTH)
+    ]);
 
-    // Generate the BMP data
-    const bmpData = generateWeatherBMP(weatherData);
+    // Generate the combined BMP data
+    const bmpData = generateCombinedBMP({
+      weather: weatherData,
+      northBus,
+      southBus
+    });
 
     // Return the BMP file with proper headers
     return new Response(bmpData, {
