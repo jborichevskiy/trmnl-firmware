@@ -60,61 +60,42 @@ app.post("/api/log", async (c) => {
   });
 });
 
-// WMO Weather codes to descriptions
-const weatherCodes: { [key: number]: string } = {
-  0: "Clear",
-  1: "Mostly Clear",
-  2: "Partly Cloudy",
-  3: "Overcast",
-  45: "Foggy",
-  48: "Foggy",
-  51: "Light Drizzle",
-  53: "Drizzle",
-  55: "Heavy Drizzle",
-  61: "Light Rain",
-  63: "Rain",
-  65: "Heavy Rain",
-  66: "Freezing Rain",
-  67: "Freezing Rain",
-  71: "Light Snow",
-  73: "Snow",
-  75: "Heavy Snow",
-  77: "Snow Grains",
-  80: "Light Showers",
-  81: "Showers",
-  82: "Heavy Showers",
-  85: "Snow Showers",
-  86: "Heavy Snow Showers",
-  95: "Thunderstorm",
-  96: "Thunderstorm w/ Hail",
-  99: "Thunderstorm w/ Hail"
-};
+// Weather data fetching from WeatherLink (Melody Heights station)
+const WEATHERLINK_STATION_TOKEN = "23ece686c4004fb2921ea8cba43c09b3";
 
-// Weather data fetching using Open-Meteo (fast, no API key)
 async function fetchWeatherData() {
   try {
-    const lat = Deno.env.get("WEATHER_LAT") || "40.02418864518805";
-    const lng = Deno.env.get("WEATHER_LNG") || "-105.28462211989343";
     const response = await fetch(
-      `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}&current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min&temperature_unit=fahrenheit&timezone=America/Denver`
+      `https://www.weatherlink.com/embeddablePage/summaryData/${WEATHERLINK_STATION_TOKEN}`
     );
 
     if (!response.ok) {
-      throw new Error(`Weather API error: ${response.status}`);
+      throw new Error(`WeatherLink API error: ${response.status}`);
     }
 
     const data = await response.json();
 
-    const temp = Math.round(data.current.temperature_2m);
-    const code = data.current.weather_code;
-    const low = Math.round(data.daily.temperature_2m_min[0]);
-    const high = Math.round(data.daily.temperature_2m_max[0]);
+    // Helper to find a value in currConditionValues by name
+    const findCurrent = (name: string) => {
+      const item = data.currConditionValues?.find((v: any) => v.sensorDataName === name);
+      return item ? Math.round(item.reportedValue) : null;
+    };
+
+    // Helper to find a value in highLowValues by name
+    const findHighLow = (name: string) => {
+      const item = data.highLowValues?.find((v: any) => v.sensorDataName === name);
+      return item ? Math.round(item.reportedValue) : null;
+    };
+
+    const temp = findCurrent("Temp") ?? 0;
+    const high = findHighLow("High Temp") ?? 0;
+    const low = findHighLow("Low Temp") ?? 0;
 
     return {
       temperature: `${temp}°F`,
       low: `${low}°F`,
       high: `${high}°F`,
-      condition: weatherCodes[code] || "Unknown",
+      condition: "",
       city: "Boulder, CO",
       time: new Date().toLocaleTimeString('en-US', {
         hour: '2-digit',
@@ -123,12 +104,12 @@ async function fetchWeatherData() {
       })
     };
   } catch (error) {
-    console.error("Weather API error:", error);
+    console.error("WeatherLink API error:", error);
     return {
       temperature: "??°F",
       low: "??°F",
       high: "??°F",
-      condition: "Unknown",
+      condition: "",
       city: "Boulder, CO",
       time: new Date().toLocaleTimeString('en-US', {
         hour: '2-digit',
