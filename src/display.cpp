@@ -47,6 +47,7 @@ RTC_DATA_ATTR int iUpdateCount = 0;
 #include <ctype.h> //iscntrl()
 #include <api-client/display.h>
 #include <trmnl_log.h>
+#include <bl.h>
 #include "png_flip.h"
 #include "../lib/bb_epaper/Fonts/nicoclean_8.h"
 #include "../lib/bb_epaper/Fonts/Inter_18.h"
@@ -840,7 +841,68 @@ PNG *png = new PNG();
     free(png); // free the decoder instance
     return rc;
 } /* png_to_epd() */
-/** 
+#ifdef BB_EPAPER
+/**
+ * @brief Draw a small battery indicator icon in the bottom-right corner
+ *        when voltage is below LOW_BATTERY_WARNING threshold.
+ *        Must be called after bbep.setBuffer() so drawing goes to the framebuffer.
+ * @param voltage Current battery voltage
+ */
+static void drawBatteryIndicator(float voltage)
+{
+    int w = bbep.width();
+    int h = bbep.height();
+
+    // Battery icon dimensions
+    const int battW = 30;
+    const int battH = 16;
+    const int nubW = 3;
+    const int nubH = 8;
+    const int margin = 30;
+
+    // Position: bottom-right corner
+    int bx = w - battW - nubW - margin;
+    int by = h - battH - margin;
+
+    // Clear background behind the icon
+    bbep.fillRect(bx - 2, by - 2, battW + nubW + 4, battH + 4, BBEP_WHITE);
+
+    // Draw battery outline
+    bbep.drawRect(bx, by, battW, battH, BBEP_BLACK);
+
+    // Draw terminal nub on the right
+    int nubY = by + (battH - nubH) / 2;
+    bbep.fillRect(bx + battW, nubY, nubW, nubH, BBEP_BLACK);
+
+    // Calculate fill level: 4.2V = full, LOW_BATTERY_CRITICAL = empty
+    float fillPct = (voltage - LOW_BATTERY_CRITICAL) / (4.2f - LOW_BATTERY_CRITICAL);
+    if (fillPct < 0.0f) fillPct = 0.0f;
+    if (fillPct > 1.0f) fillPct = 1.0f;
+
+    int innerW = battW - 4; // 2px padding each side
+    int innerH = battH - 4;
+    int fillW = (int)(innerW * fillPct);
+
+    if (fillW > 0) {
+        bbep.fillRect(bx + 2, by + 2, fillW, innerH, BBEP_BLACK);
+    }
+
+    // Critical indicator: draw "!" inside the battery
+    if (voltage < LOW_BATTERY_CRITICAL) {
+        int cx = bx + battW / 2;
+        int cy = by + battH / 2;
+        // Draw a small "!" using pixels — exclamation mark
+        // Vertical bar: 5px tall
+        for (int dy = -4; dy <= 0; dy++) {
+            bbep.drawPixel(cx, cy + dy, BBEP_WHITE);
+        }
+        // Dot
+        bbep.drawPixel(cx, cy + 2, BBEP_WHITE);
+    }
+}
+#endif
+
+/**
  * @brief Function to show the image on the display
  * @param image_buffer pointer to the uint8_t image buffer
  * @param reverse shows if the color scheme is reverse
@@ -915,6 +977,12 @@ void display_show_image(uint8_t *image_buffer, int data_size, bool bWait)
 #endif
         }
 #ifdef BB_EPAPER
+        {
+            float voltage = bl_get_battery_voltage();
+            if (voltage > 0) {
+                drawBatteryIndicator(voltage);
+            }
+        }
         bbep.writePlane(PLANE_0); // send image data to the EPD
         iRefreshMode = REFRESH_PARTIAL;
 #endif

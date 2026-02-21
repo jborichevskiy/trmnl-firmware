@@ -1948,6 +1948,11 @@ static float readBatteryVoltage(void)
 #endif // FAKE_BATTERY_VOLTAGE
 }
 
+float bl_get_battery_voltage(void)
+{
+  return vBatt;
+}
+
 /**
  * @brief Function to submit a log string to the API
  * @param log_buffer pointer to the buffer that contains log note

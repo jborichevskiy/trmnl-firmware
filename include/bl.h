@@ -15,6 +15,8 @@ void bl_init(void);
  */
 void bl_process(void);
 
+float bl_get_battery_voltage(void);
+
 uint32_t getTime(void);
 
 enum LogAction {

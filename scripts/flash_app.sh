@@ -13,7 +13,8 @@ fi
 
 FIRMWARE_FILE="$1"
 BAUD_RATE=$((115200 * 4))
-ESPTOOL="pio pkg exec -p tool-esptoolpy esptool.py -- "
+PIO="${PIO:-$HOME/.platformio/penv/bin/pio}"
+ESPTOOL="$PIO pkg exec -p tool-esptoolpy esptool.py -- "
 ESPTOOL_CMD="$ESPTOOL --chip esp32c3 --baud $BAUD_RATE"
 
 if [ ! -f "$FIRMWARE_FILE" ]; then
