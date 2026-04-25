@@ -61,16 +61,12 @@ function checkAuth(c: any): boolean {
   return UPLOAD_SECRET !== "" && key === UPLOAD_SECRET;
 }
 
-function isValidOverlayName(name: string): boolean {
-  return /^[a-z0-9_-]{1,20}$/.test(name);
-}
-
 // Upload overlay PNG by name
 app.post("/overlay/:name", async (c) => {
   if (!checkAuth(c)) return c.text("Unauthorized", 401);
   const name = c.req.param("name");
-  if (!isValidOverlayName(name)) {
-    return c.text("Invalid name. Use 1-20 lowercase letters, numbers, hyphens, or underscores.", 400);
+  if (!OVERLAY_CONDITIONS.includes(name as OverlayCondition)) {
+    return c.text(`Invalid name. Use: ${OVERLAY_CONDITIONS.join(", ")}`, 400);
   }
   const body = await c.req.arrayBuffer();
   await blob.set(`overlay_${name}`, new Uint8Array(body));
@@ -81,8 +77,8 @@ app.post("/overlay/:name", async (c) => {
 app.delete("/overlay/:name", async (c) => {
   if (!checkAuth(c)) return c.text("Unauthorized", 401);
   const name = c.req.param("name");
-  if (!isValidOverlayName(name)) {
-    return c.text("Invalid name.", 400);
+  if (!OVERLAY_CONDITIONS.includes(name as OverlayCondition)) {
+    return c.text(`Invalid name. Use: ${OVERLAY_CONDITIONS.join(", ")}`, 400);
   }
   await blob.delete(`overlay_${name}`);
   return c.text(`Overlay '${name}' deleted`);
@@ -91,7 +87,7 @@ app.delete("/overlay/:name", async (c) => {
 // Get overlay PNG by name (for gallery previews)
 app.get("/overlay/:name", async (c) => {
   const name = c.req.param("name");
-  if (!isValidOverlayName(name)) {
+  if (!OVERLAY_CONDITIONS.includes(name as OverlayCondition)) {
     return c.text("Not found", 404);
   }
   try {
@@ -110,22 +106,12 @@ app.get("/api/overlays", async (c) => {
   const results: Record<string, boolean> = {};
   for (const name of OVERLAY_CONDITIONS) {
     try {
-      await blob.get(`overlay_${name}`);
+      const data = await blob.get(`overlay_${name}`);
       results[name] = true;
     } catch {
       results[name] = false;
     }
   }
-  // Also find custom overlays
-  try {
-    const allBlobs = await blob.list("overlay_");
-    for (const b of allBlobs) {
-      const name = b.key.replace("overlay_", "");
-      if (!OVERLAY_CONDITIONS.includes(name as OverlayCondition)) {
-        results[name] = true;
-      }
-    }
-  } catch {}
   return c.json(results);
 });
 
@@ -151,7 +137,8 @@ interface WeatherData {
 async function fetchWeatherData(): Promise<WeatherData> {
   try {
     const response = await fetch(
-      `https://www.weatherlink.com/embeddablePage/summaryData/${WEATHERLINK_STATION_TOKEN}`
+      `https://www.weatherlink.com/embeddablePage/summaryData/${WEATHERLINK_STATION_TOKEN}`,
+      { signal: AbortSignal.timeout(10000) }
     );
 
     if (!response.ok) {
@@ -244,6 +231,22 @@ function pickOverlayName(weather: WeatherData): OverlayCondition {
   return "sunny";
 }
 
+async function fetchUVIndex(): Promise<number | null> {
+  try {
+    const response = await fetch(
+      "https://api.open-meteo.com/v1/forecast?latitude=40.01&longitude=-105.27&current=uv_index&timezone=America/Denver",
+      { signal: AbortSignal.timeout(10000) }
+    );
+    if (!response.ok) throw new Error(`UV API error: ${response.status}`);
+    const data = await response.json();
+    const val = data.current?.uv_index;
+    return val != null ? Math.round(val) : null;
+  } catch (error) {
+    console.error("UV index API error:", error);
+    return null;
+  }
+}
+
 // Bus stop IDs
 const BUS_STOP_NORTH = "12551";
 const BUS_STOP_SOUTH = "19193";
@@ -251,7 +254,8 @@ const BUS_STOP_SOUTH = "19193";
 async function fetchBusData(stopId: string): Promise<{next: string | null, after: string | null}> {
   try {
     const response = await fetch(
-      `https://nodejs-prod.rtd-denver.com/api/v2/nextride/stops/${stopId}`
+      `https://nodejs-prod.rtd-denver.com/api/v2/nextride/stops/${stopId}`,
+      { signal: AbortSignal.timeout(10000) }
     );
 
     if (!response.ok) {
@@ -307,6 +311,7 @@ interface DisplayData {
   southBus: BusData;
   overlayName: string;
   baseUrl: string;
+  uvIndex: number | null;
 }
 
 // Overlay image area: 60% width, top-right
@@ -320,6 +325,19 @@ function drawRect(pixelData: Uint8Array, x: number, y: number, w: number, h: num
       setPixel(pixelData, x + dx, y + dy, paddedBytesPerRow, false);
     }
   }
+}
+
+// Low-poly sun icon (~13px diameter) centered at (cx, cy)
+function drawSunIcon(pixelData: Uint8Array, cx: number, cy: number, paddedBytesPerRow: number) {
+  drawRect(pixelData, cx - 3, cy - 3, 7, 7, paddedBytesPerRow); // body
+  drawRect(pixelData, cx, cy - 6, 1, 2, paddedBytesPerRow);     // top ray
+  drawRect(pixelData, cx, cy + 5, 1, 2, paddedBytesPerRow);     // bottom ray
+  drawRect(pixelData, cx - 6, cy, 2, 1, paddedBytesPerRow);     // left ray
+  drawRect(pixelData, cx + 5, cy, 2, 1, paddedBytesPerRow);     // right ray
+  setPixel(pixelData, cx - 5, cy - 5, paddedBytesPerRow, false); // diagonals
+  setPixel(pixelData, cx + 5, cy - 5, paddedBytesPerRow, false);
+  setPixel(pixelData, cx - 5, cy + 5, paddedBytesPerRow, false);
+  setPixel(pixelData, cx + 5, cy + 5, paddedBytesPerRow, false);
 }
 
 // Draw a QR code into the BMP pixel data
@@ -512,10 +530,12 @@ async function generateCombinedBMP(data: DisplayData): Promise<Uint8Array> {
 
   // Weather section (top)
   drawText(pixelData, data.weather.temperature, 50, 40, width, paddedBytesPerRow, 8);
-  drawText(pixelData, `H ${data.weather.high} L ${data.weather.low} ${data.weather.condition}`, 50, 120, width, paddedBytesPerRow, 3);
+  drawText(pixelData, `H ${data.weather.high} L ${data.weather.low} ${data.weather.condition}`, 50, 130, width, paddedBytesPerRow, 3);
+
+  drawText(pixelData, `UV ${data.uvIndex ?? "--"}`, 50, 175, width, paddedBytesPerRow, 3);
 
   // Divider line — only extends to the image edge (x=50 to x=320, so length=270)
-  drawHorizontalLine(pixelData, 50, 160, OVERLAY_OFFSET_X - 50 - 10, paddedBytesPerRow);
+  drawHorizontalLine(pixelData, 50, 220, OVERLAY_OFFSET_X - 50 - 10, paddedBytesPerRow);
 
   // Bus section
   const northNext = data.northBus.next || "--:--";
@@ -523,11 +543,11 @@ async function generateCombinedBMP(data: DisplayData): Promise<Uint8Array> {
   const southNext = data.southBus.next || "--:--";
   const southAfter = data.southBus.after || "--:--";
 
-  drawText(pixelData, `NORTH BUS: ${northNext}`, 50, 190, width, paddedBytesPerRow, 3);
-  drawText(pixelData, `THEN: ${northAfter}`, 50, 225, width, paddedBytesPerRow, 2);
+  drawText(pixelData, `NORTH BUS: ${northNext}`, 50, 245, width, paddedBytesPerRow, 3);
+  drawText(pixelData, `THEN: ${northAfter}`, 50, 280, width, paddedBytesPerRow, 2);
 
-  drawText(pixelData, `SOUTH BUS: ${southNext}`, 50, 295, width, paddedBytesPerRow, 3);
-  drawText(pixelData, `THEN: ${southAfter}`, 50, 330, width, paddedBytesPerRow, 2);
+  drawText(pixelData, `SOUTH BUS: ${southNext}`, 50, 325, width, paddedBytesPerRow, 3);
+  drawText(pixelData, `THEN: ${southAfter}`, 50, 360, width, paddedBytesPerRow, 2);
 
   // Footer
   drawText(pixelData, `UPDATED ${data.weather.time}`, 50, 430, width, paddedBytesPerRow, 2);
@@ -643,10 +663,11 @@ app.get("/image/:filename", async (c) => {
   const filename = c.req.param("filename");
 
   try {
-    const [weatherData, northBus, southBus] = await Promise.all([
+    const [weatherData, northBus, southBus, uvIndex] = await Promise.all([
       fetchWeatherData(),
       fetchBusData(BUS_STOP_NORTH),
-      fetchBusData(BUS_STOP_SOUTH)
+      fetchBusData(BUS_STOP_SOUTH),
+      fetchUVIndex()
     ]);
 
     const urlParams = new URL(c.req.url).searchParams;
@@ -665,6 +686,7 @@ app.get("/image/:filename", async (c) => {
       southBus,
       overlayName,
       baseUrl,
+      uvIndex,
     });
 
     return new Response(bmpData, {
@@ -884,10 +906,12 @@ app.get("/draw", (c) => {
     <div class="spacer"></div>
     <div class="topbar-actions" id="drawActions">
       <button onclick="undo()">Undo</button>
+      <button onclick="importPNG()">Import PNG</button>
       <button class="danger-btn" onclick="clearCanvas()">Clear</button>
       <button class="danger-btn" onclick="deleteOverlay()">Delete</button>
       <button class="save-btn" onclick="save()">Save</button>
     </div>
+    <input type="file" id="fileInput" accept="image/png,image/jpeg,image/gif,image/webp" style="display:none" onchange="handleFileImport(event)">
   </div>
 
   <!-- Draw toolbar -->
@@ -971,70 +995,51 @@ app.get("/draw", (c) => {
         overlayStatus = await res.json();
       } catch { }
 
-      const conditionIds = CONDITIONS.map(c => c.id);
-      const customIds = Object.keys(overlayStatus).filter(k => overlayStatus[k] && !conditionIds.includes(k));
+      const sorted = [...CONDITIONS].sort((a, b) => (overlayStatus[b.id] ? 1 : 0) - (overlayStatus[a.id] ? 1 : 0));
+      const firstEmptyIdx = sorted.findIndex(c => !overlayStatus[c.id]);
 
-      // Conditions with overlays first
-      CONDITIONS.filter(c => overlayStatus[c.id]).forEach(c => {
-        grid.appendChild(makeConditionCard(c.id, c.label, true));
+      sorted.forEach((c, i) => {
+        // Insert + CUSTOM card right before the first empty entry
+        if (i === firstEmptyIdx) {
+          const addCard = document.createElement('div');
+          addCard.className = 'gallery-card add-custom';
+          addCard.innerHTML = '<span class="add-label">+ CUSTOM</span>';
+          addCard.onclick = () => { saveToLocal(currentCondition); currentCondition = 'custom'; document.querySelectorAll('.conditions .cond-btn').forEach(b => b.classList.remove('active')); clearCanvasRaw(); history = []; setStatus('Editing: custom'); switchView('draw'); };
+          grid.appendChild(addCard);
+        }
+
+        const card = document.createElement('div');
+        card.className = 'gallery-card';
+        const hasData = overlayStatus[c.id];
+        card.innerHTML =
+          '<div class="card-img">' +
+            (hasData
+              ? '<img src="/overlay/' + c.id + '?t=' + Date.now() + '">'
+              : '<span class="empty">No capybara yet</span>') +
+          '</div>' +
+          '<div class="card-footer">' +
+            '<span class="card-label">' + c.label + '</span>' +
+            (hasData ? '<button class="preview-btn" onclick="previewRender(\\'' + c.id + '\\')">Preview</button>' : '') +
+            '<button class="edit-btn" onclick="editCondition(\\'' + c.id + '\\')">Edit</button>' +
+          '</div>';
+        grid.appendChild(card);
+
+        // Mark condition buttons too
         const btn = document.getElementById('cond-' + c.id);
-        if (btn) btn.classList.add('has-data');
+        if (btn) btn.classList.toggle('has-data', !!hasData);
       });
 
-      // Custom overlays
-      customIds.forEach(id => {
-        grid.appendChild(makeConditionCard(id, id, true));
-      });
-
-      // + CUSTOM card
-      const addCard = document.createElement('div');
-      addCard.className = 'gallery-card add-custom';
-      addCard.innerHTML = '<span class="add-label">+ CUSTOM</span>';
-      addCard.onclick = () => { saveToLocal(currentCondition); currentCondition = 'custom'; document.querySelectorAll('.conditions .cond-btn').forEach(b => b.classList.remove('active')); clearCanvasRaw(); history = []; setStatus('Editing: custom'); switchView('draw'); };
-      grid.appendChild(addCard);
-
-      // Empty conditions last
-      CONDITIONS.filter(c => !overlayStatus[c.id]).forEach(c => {
-        grid.appendChild(makeConditionCard(c.id, c.label, false));
-        const btn = document.getElementById('cond-' + c.id);
-        if (btn) btn.classList.remove('has-data');
-      });
-    }
-
-    function makeConditionCard(id, label, hasData) {
-      const card = document.createElement('div');
-      card.className = 'gallery-card';
-      card.innerHTML =
-        '<div class="card-img">' +
-          (hasData
-            ? '<img src="/overlay/' + id + '?t=' + Date.now() + '">'
-            : '<span class="empty">No capybara yet</span>') +
-        '</div>' +
-        '<div class="card-footer">' +
-          '<span class="card-label">' + label + '</span>' +
-          (hasData ? '<button class="preview-btn" onclick="previewRender(\\'' + id + '\\')">Preview</button>' : '') +
-          '<button class="edit-btn" onclick="editCondition(\\'' + id + '\\')">Edit</button>' +
-        '</div>';
-      return card;
+      // If all conditions have overlays, add the + CUSTOM card at the end
+      if (firstEmptyIdx === -1) {
+        const addCard = document.createElement('div');
+        addCard.className = 'gallery-card add-custom';
+        addCard.innerHTML = '<span class="add-label">+ CUSTOM</span>';
+        addCard.onclick = () => { saveToLocal(currentCondition); currentCondition = 'custom'; document.querySelectorAll('.conditions .cond-btn').forEach(b => b.classList.remove('active')); clearCanvasRaw(); history = []; setStatus('Editing: custom'); switchView('draw'); };
+        grid.appendChild(addCard);
+      }
     }
 
     function editCondition(id) {
-      const conditionIds = CONDITIONS.map(c => c.id);
-      if (!conditionIds.includes(id) && !localStorage.getItem('overlay_' + id)) {
-        // Custom overlay — load from server into canvas
-        saveToLocal(currentCondition);
-        currentCondition = id;
-        document.querySelectorAll('.conditions .cond-btn').forEach(b => b.classList.remove('active'));
-        clearCanvasRaw();
-        const img = new Image();
-        img.crossOrigin = 'anonymous';
-        img.onload = () => { ctx.imageSmoothingEnabled = false; ctx.drawImage(img, 0, 0); };
-        img.src = '/overlay/' + id + '?t=' + Date.now();
-        history = [];
-        setStatus('Editing: ' + id);
-        switchView('draw');
-        return;
-      }
       selectCondition(id);
       switchView('draw');
     }
@@ -1092,8 +1097,7 @@ app.get("/draw", (c) => {
       saveToLocal(currentCondition);
       currentCondition = id;
       document.querySelectorAll('.conditions .cond-btn').forEach(b => b.classList.remove('active'));
-      const btn = document.getElementById('cond-' + id);
-      if (btn) btn.classList.add('active');
+      document.getElementById('cond-' + id).classList.add('active');
       loadFromLocal(id);
       history = [];
       setStatus('Editing: ' + id);
@@ -1201,6 +1205,35 @@ app.get("/draw", (c) => {
       setStatus('Canvas cleared');
     }
 
+    function importPNG() {
+      document.getElementById('fileInput').click();
+    }
+
+    function handleFileImport(e) {
+      const file = e.target.files[0];
+      if (!file) return;
+      e.target.value = '';
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        const img = new Image();
+        img.onload = () => {
+          history.push(ctx.getImageData(0, 0, DRAW_W, DRAW_H));
+          clearCanvasRaw();
+          // Scale to fit canvas preserving aspect ratio, centered
+          const scale = Math.min(DRAW_W / img.width, DRAW_H / img.height);
+          const dw = Math.round(img.width * scale);
+          const dh = Math.round(img.height * scale);
+          const dx = Math.floor((DRAW_W - dw) / 2);
+          const dy = Math.floor((DRAW_H - dh) / 2);
+          ctx.drawImage(img, dx, dy, dw, dh);
+          saveToLocal(currentCondition);
+          setStatus('Imported: ' + file.name);
+        };
+        img.src = ev.target.result;
+      };
+      reader.readAsDataURL(file);
+    }
+
     async function save() {
       let saveAs = currentCondition;
       if (saveAs === 'custom') {
@@ -1244,27 +1277,9 @@ app.get("/draw", (c) => {
           grid.appendChild(btn);
         });
         box.appendChild(grid);
-        const customRow = document.createElement('div');
-        customRow.style.cssText = 'display:flex;gap:8px;margin-top:12px;';
-        const input = document.createElement('input');
-        input.type = 'text';
-        input.placeholder = 'custom name';
-        input.maxLength = 20;
-        input.style.cssText = 'flex:1;padding:10px;border-radius:8px;border:1px solid #444;background:#1a1a1a;color:#e0e0e0;font-size:14px;outline:none;';
-        const customBtn = document.createElement('button');
-        customBtn.textContent = 'Save';
-        customBtn.style.cssText = 'padding:10px 16px;border-radius:8px;border:1px solid #4a9eff;background:#2a2a2a;color:#4a9eff;font-size:14px;cursor:pointer;touch-action:manipulation;';
-        customBtn.onclick = () => {
-          const val = input.value.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '-').slice(0, 20);
-          if (!val) { input.focus(); return; }
-          document.body.removeChild(overlay); resolve(val);
-        };
-        customRow.appendChild(input);
-        customRow.appendChild(customBtn);
-        box.appendChild(customRow);
         const cancel = document.createElement('button');
         cancel.textContent = 'Cancel';
-        cancel.style.cssText = 'margin-top:8px;width:100%;padding:10px;border-radius:8px;border:1px solid #555;background:transparent;color:#999;font-size:14px;cursor:pointer;touch-action:manipulation;';
+        cancel.style.cssText = 'margin-top:12px;width:100%;padding:10px;border-radius:8px;border:1px solid #555;background:transparent;color:#999;font-size:14px;cursor:pointer;touch-action:manipulation;';
         cancel.onclick = () => { document.body.removeChild(overlay); resolve(null); };
         box.appendChild(cancel);
         overlay.appendChild(box);
