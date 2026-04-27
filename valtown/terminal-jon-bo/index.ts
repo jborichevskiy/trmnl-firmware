@@ -231,6 +231,53 @@ function pickOverlayName(weather: WeatherData): OverlayCondition {
   return "sunny";
 }
 
+interface GridData {
+  percent: number | null;
+  isClean: boolean | null;
+  hoursUntilClean: number | null;
+}
+
+async function fetchGridData(): Promise<GridData> {
+  try {
+    const response = await fetch("https://weis-api.vercel.app/api/weis-v4", {
+      signal: AbortSignal.timeout(10000)
+    });
+    if (!response.ok) throw new Error(`WEIS API error: ${response.status}`);
+    const json = await response.json();
+
+    const data = json.data as Array<{ timestamp: string; value: number }>;
+
+    // Walk forward until we pass now; the last entry before now is the current reading.
+    const nowMs = Date.now();
+    let currentIdx = 0;
+    for (let i = 0; i < data.length; i++) {
+      if (new Date(data[i].timestamp).getTime() > nowMs) break;
+      currentIdx = i;
+    }
+    const current = data[currentIdx];
+    const isClean = current.value > 75;
+
+    // If not currently clean, find the next future entry that crosses 75%.
+    let hoursUntilClean: number | null = null;
+    if (!isClean) {
+      for (let i = currentIdx + 1; i < data.length; i++) {
+        if (data[i].value > 75) {
+          const cleanMs = new Date(data[i].timestamp).getTime();
+          hoursUntilClean = Math.round((cleanMs - nowMs) / 3_600_000);
+          break;
+        }
+      }
+    }
+
+    const percent = Math.round(current.value);
+    console.log(`[grid] ${current.timestamp} → ${percent}% renewable, clean=${isClean}, hoursUntilClean=${hoursUntilClean}`);
+    return { percent, isClean, hoursUntilClean };
+  } catch (error) {
+    console.error("WEIS grid API error:", error);
+    return { percent: null, isClean: null, hoursUntilClean: null };
+  }
+}
+
 async function fetchUVIndex(): Promise<number | null> {
   try {
     const response = await fetch(
@@ -312,6 +359,7 @@ interface DisplayData {
   overlayName: string;
   baseUrl: string;
   uvIndex: number | null;
+  gridData: GridData;
 }
 
 // Overlay image area: 60% width, top-right
@@ -549,14 +597,19 @@ async function generateCombinedBMP(data: DisplayData): Promise<Uint8Array> {
   drawText(pixelData, `SOUTH BUS: ${southNext}`, 50, 325, width, paddedBytesPerRow, 3);
   drawText(pixelData, `THEN: ${southAfter}`, 50, 360, width, paddedBytesPerRow, 2);
 
-  // Footer
-  drawText(pixelData, `UPDATED ${data.weather.time}`, 50, 430, width, paddedBytesPerRow, 2);
+  // Power / grid section — left panel, below bus data
+  drawHorizontalLine(pixelData, 50, 393, OVERLAY_OFFSET_X - 50 - 10, paddedBytesPerRow);
+  const pctText = data.gridData.percent !== null ? `${data.gridData.percent}%` : "--";
+  drawText(pixelData, `GRID: ${pctText} RENEWABLES`, 50, 408, width, paddedBytesPerRow, 2);
+  const cleanText = data.gridData.isClean === true
+    ? "CLEAN"
+    : data.gridData.hoursUntilClean !== null
+      ? `CLEAN IN ${data.gridData.hoursUntilClean} HRS`
+      : data.gridData.isClean === false ? "NOT CLEAN" : "---";
+  drawText(pixelData, cleanText, 50, 435, width, paddedBytesPerRow, 3);
 
   // Composite the weather-condition overlay on top
   await compositeOverlay(pixelData, width, height, paddedBytesPerRow, data.overlayName, data.baseUrl);
-
-  // // Debug label under overlay area
-  // drawText(pixelData, `OVR: ${data.overlayName.toUpperCase()}`, OVERLAY_OFFSET_X, 430, width, paddedBytesPerRow, 2);
 
   const bmpData = new Uint8Array(fileSize);
   bmpData.set(new Uint8Array(header), 0);
@@ -610,6 +663,7 @@ function drawText(pixelData: Uint8Array, text: string, x: number, y: number, wid
     ',': [0x00, 0x80, 0x60, 0x00, 0x00],
     '.': [0x00, 0x60, 0x60, 0x00, 0x00],
     '-': [0x08, 0x08, 0x08, 0x08, 0x08],
+    '%': [0x23, 0x13, 0x08, 0x64, 0x62],
   };
   
   let currentX = x;
@@ -663,11 +717,12 @@ app.get("/image/:filename", async (c) => {
   const filename = c.req.param("filename");
 
   try {
-    const [weatherData, northBus, southBus, uvIndex] = await Promise.all([
+    const [weatherData, northBus, southBus, uvIndex, gridData] = await Promise.all([
       fetchWeatherData(),
       fetchBusData(BUS_STOP_NORTH),
       fetchBusData(BUS_STOP_SOUTH),
-      fetchUVIndex()
+      fetchUVIndex(),
+      fetchGridData()
     ]);
 
     const urlParams = new URL(c.req.url).searchParams;
@@ -687,6 +742,7 @@ app.get("/image/:filename", async (c) => {
       overlayName,
       baseUrl,
       uvIndex,
+      gridData,
     });
 
     return new Response(bmpData, {
