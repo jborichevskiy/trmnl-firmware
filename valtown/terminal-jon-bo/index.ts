@@ -115,7 +115,7 @@ app.get("/api/overlays", async (c) => {
   return c.json(results);
 });
 
-// Weather data fetching from WeatherLink (Melody Heights station)
+// Weather data fetching from WeatherLink (Melody Heights station) — current temp only
 const WEATHERLINK_STATION_TOKEN = "23ece686c4004fb2921ea8cba43c09b3";
 const UPLOAD_SECRET = Deno.env.get("UPLOAD_SECRET") || "";
 
@@ -126,108 +126,123 @@ interface WeatherData {
   condition: string;
   city: string;
   time: string;
-  // Raw values for condition detection
-  rawTemp: number;
-  rawWindSpeed: number;
-  rawRainRate: number;
-  rawHumidity: number;
-  rawDewPoint: number;
+  rawTemp: number;    // from WeatherLink (neighborhood sensor)
+  wmoCode: number;    // from Open-Meteo
+  rawWindSpeed: number; // mph, from Open-Meteo
 }
 
-async function fetchWeatherData(): Promise<WeatherData> {
+// Fetches only current temperature from the local WeatherLink station
+async function fetchWeatherLinkTemp(): Promise<{ rawTemp: number }> {
   try {
     const response = await fetch(
       `https://www.weatherlink.com/embeddablePage/summaryData/${WEATHERLINK_STATION_TOKEN}`,
       { signal: AbortSignal.timeout(10000) }
     );
-
-    if (!response.ok) {
-      throw new Error(`WeatherLink API error: ${response.status}`);
-    }
-
+    if (!response.ok) throw new Error(`WeatherLink API error: ${response.status}`);
     const data = await response.json();
-
-    const findCurrent = (name: string) => {
-      const item = data.currConditionValues?.find((v: any) => v.sensorDataName === name);
-      return item ? item.reportedValue : null;
-    };
-
-    const findHighLow = (name: string) => {
-      const item = data.highLowValues?.find((v: any) => v.sensorDataName === name);
-      return item ? Math.round(item.reportedValue) : null;
-    };
-
-    const rawTemp = findCurrent("Temp") ?? 0;
-    const rawWindSpeed = findCurrent("Wind Speed") ?? 0;
-    const rawRainRate = findCurrent("Rain Rate") ?? 0;
-    const rawHumidity = findCurrent("Hum") ?? 0;
-    const rawDewPoint = findCurrent("Dew Point") ?? 0;
-    const temp = Math.round(rawTemp);
-    const high = findHighLow("High Temp") ?? 0;
-    const low = findHighLow("Low Temp") ?? 0;
-
-    return {
-      temperature: `${temp}°F`,
-      low: `${low}°F`,
-      high: `${high}°F`,
-      condition: "",
-      city: "Boulder, CO",
-      time: new Date().toLocaleTimeString('en-US', {
-        hour: '2-digit',
-        minute: '2-digit',
-        timeZone: 'America/Denver'
-      }),
-      rawTemp,
-      rawWindSpeed,
-      rawRainRate,
-      rawHumidity,
-      rawDewPoint,
-    };
+    const rawTemp = data.currConditionValues?.find((v: any) => v.sensorDataName === "Temp")?.reportedValue ?? 0;
+    return { rawTemp };
   } catch (error) {
     console.error("WeatherLink API error:", error);
-    return {
-      temperature: "??°F",
-      low: "??°F",
-      high: "??°F",
-      condition: "",
-      city: "Boulder, CO",
-      time: new Date().toLocaleTimeString('en-US', {
-        hour: '2-digit',
-        minute: '2-digit',
-        timeZone: 'America/Denver'
-      }),
-      rawTemp: 40,
-      rawWindSpeed: 0,
-      rawRainRate: 0,
-      rawHumidity: 50,
-      rawDewPoint: 30,
-    };
+    return { rawTemp: 0 };
   }
+}
+
+interface OpenMeteoData {
+  wmoCode: number;
+  high: number;
+  low: number;
+  windSpeed: number; // mph
+}
+
+// Fetches condition (WMO code), daily high/low, and current wind from Open-Meteo
+async function fetchOpenMeteoData(): Promise<OpenMeteoData> {
+  try {
+    const response = await fetch(
+      "https://api.open-meteo.com/v1/forecast?latitude=40.01&longitude=-105.27" +
+      "&current=weather_code,wind_speed_10m" +
+      "&daily=temperature_2m_max,temperature_2m_min" +
+      "&temperature_unit=fahrenheit&wind_speed_unit=mph" +
+      "&timezone=America/Denver",
+      { signal: AbortSignal.timeout(10000) }
+    );
+    if (!response.ok) throw new Error(`Open-Meteo API error: ${response.status}`);
+    const data = await response.json();
+    const wmoCode = data.current?.weather_code ?? 0;
+    const windSpeed = Math.round(data.current?.wind_speed_10m ?? 0);
+    const high = Math.round(data.daily?.temperature_2m_max?.[0] ?? 0);
+    const low = Math.round(data.daily?.temperature_2m_min?.[0] ?? 0);
+    console.log(`[open-meteo] wmo=${wmoCode}, wind=${windSpeed}mph, high=${high}°F, low=${low}°F`);
+    return { wmoCode, high, low, windSpeed };
+  } catch (error) {
+    console.error("Open-Meteo API error:", error);
+    return { wmoCode: 0, high: 0, low: 0, windSpeed: 0 };
+  }
+}
+
+// WMO code → human-readable label
+function wmoDescription(code: number): string {
+  if (code === 0 || code === 1) return "CLEAR";
+  if (code === 2) return "PARTLY CLOUDY";
+  if (code === 3) return "OVERCAST";
+  if (code === 45 || code === 48) return "FOG";
+  if (code >= 51 && code <= 55) return "DRIZZLE";
+  if (code >= 61 && code <= 65) return "RAIN";
+  if (code >= 71 && code <= 77) return "SNOW";
+  if (code >= 80 && code <= 82) return "SHOWERS";
+  if (code === 85 || code === 86) return "SNOW SHOWERS";
+  if (code === 95) return "THUNDERSTORM";
+  if (code === 96 || code === 99) return "HAIL STORM";
+  return "CLEAR";
+}
+
+async function fetchWeatherData(): Promise<WeatherData> {
+  const [wl, om] = await Promise.all([fetchWeatherLinkTemp(), fetchOpenMeteoData()]);
+  const temp = Math.round(wl.rawTemp);
+  return {
+    temperature: temp !== 0 ? `${temp}°F` : "??°F",
+    high: `${om.high}°F`,
+    low: `${om.low}°F`,
+    condition: wmoDescription(om.wmoCode),
+    city: "Boulder, CO",
+    time: new Date().toLocaleTimeString('en-US', {
+      hour: '2-digit',
+      minute: '2-digit',
+      timeZone: 'America/Denver'
+    }),
+    rawTemp: wl.rawTemp,
+    wmoCode: om.wmoCode,
+    rawWindSpeed: om.windSpeed,
+  };
 }
 
 // All supported weather overlay conditions
 const OVERLAY_CONDITIONS = ["sunny", "cloudy", "foggy", "wind", "rain", "snow", "hail", "stormy"] as const;
 type OverlayCondition = typeof OVERLAY_CONDITIONS[number];
 
-// Determine which overlay to show based on weather conditions
+// Determine which overlay to show based on WMO weather code + wind speed.
+// WMO codes: https://open-meteo.com/en/docs#weathervariables
 function pickOverlayName(weather: WeatherData): OverlayCondition {
-  const tempDewSpread = Math.abs(weather.rawTemp - weather.rawDewPoint);
+  const c = weather.wmoCode;
 
-  // Stormy: heavy rain + high wind
-  if (weather.rawRainRate > 0.1 && weather.rawWindSpeed >= 20) return "stormy";
-  // Hail: precipitating near freezing (32-40°F)
-  if (weather.rawRainRate > 0 && weather.rawTemp > 32 && weather.rawTemp <= 40) return "hail";
-  // Snow: precipitating and freezing
-  if (weather.rawRainRate > 0 && weather.rawTemp <= 32) return "snow";
-  // Rain: precipitating and above freezing
-  if (weather.rawRainRate > 0 && weather.rawTemp > 40) return "rain";
-  // Foggy: very high humidity + small temp-dewpoint spread
-  if (weather.rawHumidity >= 90 && tempDewSpread < 3) return "foggy";
-  // Wind: gusty (15+ mph)
+  // Thunderstorm with hail (actual hail codes only)
+  if (c === 96 || c === 99) return "hail";
+  // Thunderstorm
+  if (c === 95) return "stormy";
+  // Snow: snow fall (71-75), snow grains (77), snow showers (85-86),
+  //       freezing drizzle (56-57), freezing rain (66-67) — all winter precip
+  if ((c >= 71 && c <= 77) || c === 85 || c === 86 || c === 56 || c === 57 || c === 66 || c === 67) return "snow";
+  // Rain / drizzle / showers
+  if ((c >= 51 && c <= 55) || (c >= 61 && c <= 65) || (c >= 80 && c <= 82)) {
+    if (weather.rawWindSpeed >= 20) return "stormy";
+    return "rain";
+  }
+  // Fog
+  if (c === 45 || c === 48) return "foggy";
+  // Overcast or partly cloudy
+  if (c === 3 || c === 2) return "cloudy";
+  // Clear/mainly clear — check wind
   if (weather.rawWindSpeed >= 15) return "wind";
-  // Cloudy: moderate-high humidity
-  if (weather.rawHumidity >= 70) return "cloudy";
-  // Sunny: default (clear, calm)
   return "sunny";
 }
 
@@ -578,9 +593,8 @@ async function generateCombinedBMP(data: DisplayData): Promise<Uint8Array> {
 
   // Weather section (top)
   drawText(pixelData, data.weather.temperature, 50, 40, width, paddedBytesPerRow, 8);
-  drawText(pixelData, `H ${data.weather.high} L ${data.weather.low} ${data.weather.condition}`, 50, 130, width, paddedBytesPerRow, 3);
-
-  drawText(pixelData, `UV ${data.uvIndex ?? "--"}`, 50, 175, width, paddedBytesPerRow, 3);
+  drawText(pixelData, `H ${data.weather.high} L ${data.weather.low}`, 50, 130, width, paddedBytesPerRow, 3);
+  drawText(pixelData, `${data.weather.condition} UV ${data.uvIndex ?? "--"}`, 50, 175, width, paddedBytesPerRow, 3);
 
   // Divider line — only extends to the image edge (x=50 to x=320, so length=270)
   drawHorizontalLine(pixelData, 50, 220, OVERLAY_OFFSET_X - 50 - 10, paddedBytesPerRow);
@@ -730,7 +744,7 @@ app.get("/image/:filename", async (c) => {
     const overlayName = (overrideOverlay && OVERLAY_CONDITIONS.includes(overrideOverlay as OverlayCondition))
       ? overrideOverlay
       : pickOverlayName(weatherData);
-    console.log(`Weather: temp=${weatherData.rawTemp}°F, wind=${weatherData.rawWindSpeed}mph, rain=${weatherData.rawRainRate} → overlay: ${overlayName}${overrideOverlay ? ' (forced)' : ''}`);
+    console.log(`Weather: temp=${weatherData.rawTemp}°F, wmo=${weatherData.wmoCode} (${weatherData.condition}), wind=${weatherData.rawWindSpeed}mph → overlay: ${overlayName}${overrideOverlay ? ' (forced)' : ''}`);
 
     const url = new URL(c.req.url);
     const baseUrl = `${url.protocol}//${url.host}`;
